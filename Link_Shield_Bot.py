@@ -7,7 +7,7 @@ import logging
 import asyncio
 import sqlite3
 from collections import OrderedDict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 from telethon import TelegramClient, events, Button
@@ -59,7 +59,7 @@ BOT_OWNER_USERNAME = os.getenv("BOT_OWNER_USERNAME", "Aaditya Kumar Sah")
 DB_FILE = "bot_data.db"
 MESSAGE_DELETE_DELAY = 10  # seconds (default, now configurable per-group)
 BOT_START_TIME = datetime.now()
-MAX_ENTITY_CACHE = 2000  # LRU cap for entity cache
+MAX_ENTITY_CACHE = 2000  # FIFO cap for entity cache
 USAGE_WRITE_INTERVAL = 300  # seconds per user to avoid DB write thrash
 DEFAULT_WARN_THRESHOLD = 3  # warnings before auto-ban
 DEFAULT_RATE_LIMIT_MSGS = 5  # default max messages in window
@@ -82,6 +82,7 @@ URL_RE = re.compile(
 )
 
 MENTION_FALLBACK_RE = re.compile(r'(?<!\S)@[a-zA-Z0-9_]+')
+BARE_COMMAND_RE = re.compile(r'^/\w+(@\w+)?$')
 
 def extract_urls(text: str) -> list[str]:
     if not text:
@@ -252,7 +253,7 @@ def count_active_chats() -> int:
         conn.close()
 
 def get_system_stats() -> dict[str, int]:
-    """Retrieve authentic real-time metrics directly from SQLite WAL tables."""
+    """Read live counts from the SQLite tables."""
     conn = db_connect()
     try:
         cur = conn.cursor()
@@ -727,24 +728,8 @@ async def is_admin(event) -> bool:
         return False
 
 def check_is_owner(sender_id: int, sender=None) -> bool:
-    """Verifies whether a user is the bot creator by numeric ID, Telegram username, or display name."""
-    if BOT_OWNER_ID and sender_id == BOT_OWNER_ID:
-        return True
-    if not sender:
-        return False
-    # Check Telegram @username handle
-    username = (getattr(sender, "username", "") or "").lower()
-    for candidate in [BOT_OWNER_USERNAME, "sanford2030", "aadityakumarsah", "aaditya"]:
-        clean = candidate.replace(" ", "").replace("@", "").lower()
-        if username and username == clean:
-            return True
-    # Check display full name (e.g., Aaditya Kumar Sah)
-    first = getattr(sender, "first_name", "") or ""
-    last = getattr(sender, "last_name", "") or ""
-    full_name = f"{first} {last}".strip().lower()
-    if full_name and ("aaditya kumar sah" in full_name or full_name == BOT_OWNER_NAME.lower()):
-        return True
-    return False
+    """The bot owner is identified by numeric ID only. Names can be copied."""
+    return BOT_OWNER_ID is not None and sender_id == BOT_OWNER_ID
 
 async def is_group_owner_or_admin(event) -> bool:
     if not event.is_group:
@@ -830,14 +815,9 @@ async def is_dangerous_mention(username: str) -> bool:
 
 def collect_mentions(event) -> list[str]:
     out: list[str] = []
-    ents = event.message.entities or []
-    for e in ents:
-        if isinstance(e, MessageEntityMention):
-            u = event.raw_text[e.offset + 1 : e.offset + e.length]
-            if u:
-                out.append(u)
-        elif isinstance(e, MessageEntityMentionName):
-            pass
+    for ent, text in event.message.get_entities_text(MessageEntityMention):
+        if len(text) > 1:
+            out.append(text[1:])
     out.extend(m[1:] for m in MENTION_FALLBACK_RE.findall(event.raw_text or "") if len(m) > 1)
     return list(dict.fromkeys(out))
 
@@ -929,7 +909,7 @@ async def stats_command(event):
         "🛡️ **Link Shield 2.0 — Live Engine Statistics**\n\n"
         f"🌐 **Active Communities:** `{stats['active_chats']}`\n"
         f"👥 **Tracked Active Users:** `{stats['unique_users']}`\n"
-        f"⚡ **In-Memory LRU Cache:** `{len(entity_cache)} / {MAX_ENTITY_CACHE}` entities\n"
+        f"⚡ **Username Cache:** `{len(entity_cache)} / {MAX_ENTITY_CACHE}` entities\n"
         f"📜 **Configured Rules:** `{stats['domains']}` domains · `{stats['channels']}` channels\n"
         f"⚠️ **Total Warnings Issued:** `{stats['warnings']}`\n"
         f"⏱️ **Engine Uptime:** `{uptime_str}`\n\n"
@@ -964,7 +944,7 @@ async def secret_stats_command(event):
             f"• **Escalated Disciplinary Warnings:** `{stats['warnings']}`\n"
             f"• **Entity Cache Size:** `{len(entity_cache)} / {MAX_ENTITY_CACHE}`\n"
             f"• **Continuous Engine Uptime:** `{uptime_str}`\n\n"
-            "*(Verified live from SQLite WAL tables without simulation formulas)*"
+            "*(Read live from the SQLite tables)*"
         )
         await event.respond(real_stats_msg, parse_mode="Markdown")
     except Exception as e:
@@ -1423,9 +1403,9 @@ async def enforce_rules(event):
 
     # Rule 2: Admins and whitelisted users are always exempt from all rules.
     # Also skip if the message is a bot command — command handlers manage their own logic.
-    if await is_admin(event) or is_whitelisted(sender_id, chat_id):
+    if is_whitelisted(sender_id, chat_id) or await is_admin(event):
         return
-    if event.raw_text and event.raw_text.startswith('/'):
+    if event.raw_text and BARE_COMMAND_RE.match(event.raw_text.strip()):
         return
 
     # Rule 2.5: Anti-spam rate limiting
@@ -1442,7 +1422,7 @@ async def enforce_rules(event):
                 from telethon.tl.types import ChatBannedRights
                 # Bug fix: until_date must be a datetime object, not a float timestamp
                 mute_rights = ChatBannedRights(
-                    until_date=datetime.now() + timedelta(seconds=60),
+                    until_date=datetime.now(timezone.utc) + timedelta(seconds=60),
                     send_messages=True
                 )
                 await client(EditBannedRequest(chat_id, sender_id, mute_rights))
@@ -1470,12 +1450,11 @@ async def enforce_rules(event):
     if has_links_in_text(event):
         whitelisted_domains = get_whitelisted_domains(chat_id)
         urls = set(extract_urls(event.raw_text or ""))
-        ents = event.message.entities or []
-        for e in ents:
-            if isinstance(e, MessageEntityUrl):
-                urls.add(event.raw_text[e.offset : e.offset + e.length])
-            elif isinstance(e, MessageEntityTextUrl) and e.url:
-                urls.add(e.url)
+        for ent, text in event.message.get_entities_text():
+            if isinstance(ent, MessageEntityTextUrl) and ent.url:
+                urls.add(ent.url)
+            elif isinstance(ent, MessageEntityUrl):
+                urls.add(text)
 
         # Bug fix: if entity detection fired but no URLs were extractable (false positive),
         # do NOT return early — fall through so mention checking (Rule 5) still runs.
